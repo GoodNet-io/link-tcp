@@ -56,14 +56,13 @@ public:
                     auto t = self->transport_.lock();
                     if (!t) return;
                     if (ec) {
-                        if (t->api_ && t->api_->notify_disconnect) {
+                        const gn_result_t reason =
+                            (ec == asio::error::eof) ? GN_OK : GN_ERR_NULL_ARG;
+                        if (t->claim_disconnect(self->conn_id) &&
+                            t->api_ && t->api_->notify_disconnect) {
                             t->api_->notify_disconnect(
-                                t->api_->host_ctx, self->conn_id,
-                                ec == asio::error::eof
-                                    ? GN_OK
-                                    : GN_ERR_NULL_ARG);
+                                t->api_->host_ctx, self->conn_id, reason);
                         }
-                        t->erase_session(self->conn_id);
                         return;
                     }
                     if (n > 0) {
@@ -92,12 +91,12 @@ public:
                                     self->host_api_failures_.fetch_add(
                                         1, std::memory_order_relaxed) + 1;
                                 if (fails >= 16) {
-                                    if (t->api_->notify_disconnect) {
+                                    if (t->claim_disconnect(self->conn_id) &&
+                                        t->api_->notify_disconnect) {
                                         (void)t->api_->notify_disconnect(
                                             t->api_->host_ctx,
                                             self->conn_id, GN_OK);
                                     }
-                                    t->erase_session(self->conn_id);
                                     return;
                                 }
                             }
@@ -239,11 +238,11 @@ private:
                     auto t = self->transport_.lock();
                     if (!t) return;
                     if (ec) {
-                        if (t->api_ && t->api_->notify_disconnect) {
+                        if (t->claim_disconnect(self->conn_id) &&
+                            t->api_ && t->api_->notify_disconnect) {
                             t->api_->notify_disconnect(
                                 t->api_->host_ctx, self->conn_id, GN_ERR_NULL_ARG);
                         }
-                        t->erase_session(self->conn_id);
                         return;
                     }
                     t->bytes_out_.fetch_add(n, std::memory_order_relaxed);
@@ -671,6 +670,12 @@ void TcpLink::erase_session(gn_conn_id_t id) {
     sessions_.erase(id);
 }
 
+bool TcpLink::claim_disconnect(gn_conn_id_t id) {
+    std::lock_guard lk(sessions_mu_);
+    if (shutdown_.load(std::memory_order_acquire)) return false;
+    return sessions_.erase(id) > 0;
+}
+
 std::shared_ptr<TcpLink::Session>
 TcpLink::find_session(gn_conn_id_t id) const {
     std::lock_guard lk(sessions_mu_);
@@ -679,8 +684,6 @@ TcpLink::find_session(gn_conn_id_t id) const {
 }
 
 void TcpLink::shutdown() {
-    if (shutdown_.exchange(true, std::memory_order_acq_rel)) return;
-
     if (acceptor_) {
         std::error_code ec;
         /// `close(ec)` is best-effort on shutdown — the FD is gone
@@ -706,9 +709,18 @@ void TcpLink::shutdown() {
     /// PluginManager drain budget. Per `link.md` §7 the shutdown
     /// must release every kernel-observable session before the
     /// io_context tear-down.
+    ///
+    /// `shutdown_.exchange(true)` runs INSIDE the snapshot lock so a
+    /// worker callback racing with shutdown either (a) wins the lock
+    /// first, sees `shutdown_=false`, claims its id, and emits on the
+    /// worker thread, or (b) loses, sees `shutdown_=true` after the
+    /// snapshot block grabbed the lock, and bails — letting the
+    /// snapshot below carry the kernel-observable release on the
+    /// caller thread per `link.md` §9 step 3.
     std::vector<gn_conn_id_t> live_ids;
     {
         std::lock_guard lk(sessions_mu_);
+        if (shutdown_.exchange(true, std::memory_order_acq_rel)) return;
         live_ids.reserve(sessions_.size());
         for (auto& [id, s] : sessions_) {
             live_ids.push_back(id);

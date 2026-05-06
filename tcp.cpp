@@ -663,6 +663,7 @@ void TcpLink::register_session(gn_conn_id_t id,
 {
     std::lock_guard lk(sessions_mu_);
     sessions_[id] = std::move(s);
+    published_ids_.push_back(id);
 }
 
 void TcpLink::erase_session(gn_conn_id_t id) {
@@ -698,39 +699,41 @@ void TcpLink::shutdown() {
         acceptor_.reset();
     }
 
-    /// Snapshot conn ids under the lock, close sockets, then notify
-    /// the kernel side SYNCHRONOUSLY for each session before stopping
-    /// the io_context. `ioc_.stop()` would otherwise drop pending
-    /// strand-bound continuations — including the read-completion
-    /// path that normally fires `notify_disconnect`. Without sync
-    /// notification, kernel-side `SessionRegistry` keeps live
-    /// `SecuritySession` records past tcp shutdown, which in turn
-    /// keeps the security plugin's lifetime anchor alive past the
-    /// PluginManager drain budget. Per `link.md` §7 the shutdown
-    /// must release every kernel-observable session before the
-    /// io_context tear-down.
+    /// Drain every ever-published conn id through notify_disconnect on
+    /// the caller thread before stopping the io_context. The
+    /// append-only `published_ids_` log captures every id the worker
+    /// announced via `notify_connect`; `sessions_` is just the live
+    /// socket map and may already be empty if a worker callback raced
+    /// ahead of shutdown and erased its session. Without this drain a
+    /// worker that emitted disconnect on its own thread before
+    /// shutdown ran would leave zero caller-thread emits and break
+    /// the `notify_connect → notify_disconnect on shutdown caller
+    /// thread` invariant from `link.md` §9 step 3.
     ///
-    /// `shutdown_.exchange(true)` runs INSIDE the snapshot lock so a
-    /// worker callback racing with shutdown either (a) wins the lock
-    /// first, sees `shutdown_=false`, claims its id, and emits on the
-    /// worker thread, or (b) loses, sees `shutdown_=true` after the
-    /// snapshot block grabbed the lock, and bails — letting the
-    /// snapshot below carry the kernel-observable release on the
-    /// caller thread per `link.md` §9 step 3.
-    std::vector<gn_conn_id_t> live_ids;
+    /// The kernel resolves the resulting double-emit through
+    /// `GN_ERR_NOT_FOUND` (see `core/kernel/host_api_builder.cpp`
+    /// `thunk_notify_disconnect`): the second call observes the
+    /// already-erased registry record and returns without re-firing
+    /// `DISCONNECTED`, so the redundant emit is benign.
+    ///
+    /// `shutdown_.exchange(true)` runs INSIDE the lock so a worker
+    /// callback racing with shutdown either (a) wins the lock first,
+    /// sees `shutdown_=false`, claims its id, and emits on the worker
+    /// thread, or (b) loses, sees `shutdown_=true`, and bails — the
+    /// drain below then carries the kernel-observable release on the
+    /// caller thread either way.
+    std::vector<gn_conn_id_t> ids_to_emit;
     {
         std::lock_guard lk(sessions_mu_);
         if (shutdown_.exchange(true, std::memory_order_acq_rel)) return;
-        live_ids.reserve(sessions_.size());
-        for (auto& [id, s] : sessions_) {
-            live_ids.push_back(id);
-            s->do_close();
-        }
+        ids_to_emit = std::move(published_ids_);
+        published_ids_.clear();
+        for (auto& [id, s] : sessions_) s->do_close();
         sessions_.clear();
     }
 
     if (api_ && api_->notify_disconnect) {
-        for (const auto id : live_ids) {
+        for (const auto id : ids_to_emit) {
             (void)api_->notify_disconnect(api_->host_ctx, id, GN_OK);
         }
     }

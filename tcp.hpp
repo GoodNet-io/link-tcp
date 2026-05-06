@@ -155,6 +155,13 @@ private:
     mutable std::mutex                                                  sessions_mu_;
     std::unordered_map<gn_conn_id_t, std::shared_ptr<Session>>          sessions_;
 
+    /// Append-only record of every conn id ever registered via
+    /// register_session. shutdown() drains this through
+    /// notify_disconnect on the caller thread so each notify_connect
+    /// maps to one caller-thread notify_disconnect even when a worker
+    /// callback already emitted runtime disconnect on its own thread.
+    std::vector<gn_conn_id_t>                                           published_ids_;
+
     /// Per-transport counters. Updated from the worker thread on each
     /// completed read / write, snapshotted lock-free through `stats()`.
     std::atomic<std::uint64_t> bytes_in_{0};

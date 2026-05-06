@@ -56,14 +56,13 @@ public:
                     auto t = self->transport_.lock();
                     if (!t) return;
                     if (ec) {
-                        if (t->api_ && t->api_->notify_disconnect) {
+                        const gn_result_t reason =
+                            (ec == asio::error::eof) ? GN_OK : GN_ERR_NULL_ARG;
+                        if (t->claim_disconnect(self->conn_id) &&
+                            t->api_ && t->api_->notify_disconnect) {
                             t->api_->notify_disconnect(
-                                t->api_->host_ctx, self->conn_id,
-                                ec == asio::error::eof
-                                    ? GN_OK
-                                    : GN_ERR_NULL_ARG);
+                                t->api_->host_ctx, self->conn_id, reason);
                         }
-                        t->erase_session(self->conn_id);
                         return;
                     }
                     if (n > 0) {
@@ -92,12 +91,12 @@ public:
                                     self->host_api_failures_.fetch_add(
                                         1, std::memory_order_relaxed) + 1;
                                 if (fails >= 16) {
-                                    if (t->api_->notify_disconnect) {
+                                    if (t->claim_disconnect(self->conn_id) &&
+                                        t->api_->notify_disconnect) {
                                         (void)t->api_->notify_disconnect(
                                             t->api_->host_ctx,
                                             self->conn_id, GN_OK);
                                     }
-                                    t->erase_session(self->conn_id);
                                     return;
                                 }
                             }
@@ -239,11 +238,11 @@ private:
                     auto t = self->transport_.lock();
                     if (!t) return;
                     if (ec) {
-                        if (t->api_ && t->api_->notify_disconnect) {
+                        if (t->claim_disconnect(self->conn_id) &&
+                            t->api_ && t->api_->notify_disconnect) {
                             t->api_->notify_disconnect(
                                 t->api_->host_ctx, self->conn_id, GN_ERR_NULL_ARG);
                         }
-                        t->erase_session(self->conn_id);
                         return;
                     }
                     t->bytes_out_.fetch_add(n, std::memory_order_relaxed);
@@ -664,11 +663,18 @@ void TcpLink::register_session(gn_conn_id_t id,
 {
     std::lock_guard lk(sessions_mu_);
     sessions_[id] = std::move(s);
+    published_ids_.push_back(id);
 }
 
 void TcpLink::erase_session(gn_conn_id_t id) {
     std::lock_guard lk(sessions_mu_);
     sessions_.erase(id);
+}
+
+bool TcpLink::claim_disconnect(gn_conn_id_t id) {
+    std::lock_guard lk(sessions_mu_);
+    if (shutdown_.load(std::memory_order_acquire)) return false;
+    return sessions_.erase(id) > 0;
 }
 
 std::shared_ptr<TcpLink::Session>
@@ -679,8 +685,6 @@ TcpLink::find_session(gn_conn_id_t id) const {
 }
 
 void TcpLink::shutdown() {
-    if (shutdown_.exchange(true, std::memory_order_acq_rel)) return;
-
     if (acceptor_) {
         std::error_code ec;
         /// `close(ec)` is best-effort on shutdown — the FD is gone
@@ -695,30 +699,41 @@ void TcpLink::shutdown() {
         acceptor_.reset();
     }
 
-    /// Snapshot conn ids under the lock, close sockets, then notify
-    /// the kernel side SYNCHRONOUSLY for each session before stopping
-    /// the io_context. `ioc_.stop()` would otherwise drop pending
-    /// strand-bound continuations — including the read-completion
-    /// path that normally fires `notify_disconnect`. Without sync
-    /// notification, kernel-side `SessionRegistry` keeps live
-    /// `SecuritySession` records past tcp shutdown, which in turn
-    /// keeps the security plugin's lifetime anchor alive past the
-    /// PluginManager drain budget. Per `link.md` §7 the shutdown
-    /// must release every kernel-observable session before the
-    /// io_context tear-down.
-    std::vector<gn_conn_id_t> live_ids;
+    /// Drain every ever-published conn id through notify_disconnect on
+    /// the caller thread before stopping the io_context. The
+    /// append-only `published_ids_` log captures every id the worker
+    /// announced via `notify_connect`; `sessions_` is just the live
+    /// socket map and may already be empty if a worker callback raced
+    /// ahead of shutdown and erased its session. Without this drain a
+    /// worker that emitted disconnect on its own thread before
+    /// shutdown ran would leave zero caller-thread emits and break
+    /// the `notify_connect → notify_disconnect on shutdown caller
+    /// thread` invariant from `link.md` §9 step 3.
+    ///
+    /// The kernel resolves the resulting double-emit through
+    /// `GN_ERR_NOT_FOUND` (see `core/kernel/host_api_builder.cpp`
+    /// `thunk_notify_disconnect`): the second call observes the
+    /// already-erased registry record and returns without re-firing
+    /// `DISCONNECTED`, so the redundant emit is benign.
+    ///
+    /// `shutdown_.exchange(true)` runs INSIDE the lock so a worker
+    /// callback racing with shutdown either (a) wins the lock first,
+    /// sees `shutdown_=false`, claims its id, and emits on the worker
+    /// thread, or (b) loses, sees `shutdown_=true`, and bails — the
+    /// drain below then carries the kernel-observable release on the
+    /// caller thread either way.
+    std::vector<gn_conn_id_t> ids_to_emit;
     {
         std::lock_guard lk(sessions_mu_);
-        live_ids.reserve(sessions_.size());
-        for (auto& [id, s] : sessions_) {
-            live_ids.push_back(id);
-            s->do_close();
-        }
+        if (shutdown_.exchange(true, std::memory_order_acq_rel)) return;
+        ids_to_emit = std::move(published_ids_);
+        published_ids_.clear();
+        for (auto& [id, s] : sessions_) s->do_close();
         sessions_.clear();
     }
 
     if (api_ && api_->notify_disconnect) {
-        for (const auto id : live_ids) {
+        for (const auto id : ids_to_emit) {
             (void)api_->notify_disconnect(api_->host_ctx, id, GN_OK);
         }
     }

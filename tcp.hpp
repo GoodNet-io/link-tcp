@@ -131,6 +131,13 @@ private:
 
     void register_session(gn_conn_id_t id, std::shared_ptr<Session> s);
     void erase_session(gn_conn_id_t id);
+    /// Atomically claim disconnect emission for @p id: under
+    /// `sessions_mu_`, fail-fast if `shutdown_` is set (the shutdown
+    /// path will emit on the caller thread instead) and otherwise
+    /// erase the session record. Returns true when the caller owns
+    /// the `notify_disconnect` emission for this id; false when
+    /// shutdown owns it or the id was already gone.
+    [[nodiscard]] bool claim_disconnect(gn_conn_id_t id);
     [[nodiscard]] std::shared_ptr<Session> find_session(gn_conn_id_t id) const;
 
     /// Build a uri-string for the conn record from a peer endpoint.
@@ -147,6 +154,13 @@ private:
 
     mutable std::mutex                                                  sessions_mu_;
     std::unordered_map<gn_conn_id_t, std::shared_ptr<Session>>          sessions_;
+
+    /// Append-only record of every conn id ever registered via
+    /// register_session. shutdown() drains this through
+    /// notify_disconnect on the caller thread so each notify_connect
+    /// maps to one caller-thread notify_disconnect even when a worker
+    /// callback already emitted runtime disconnect on its own thread.
+    std::vector<gn_conn_id_t>                                           published_ids_;
 
     /// Per-transport counters. Updated from the worker thread on each
     /// completed read / write, snapshotted lock-free through `stats()`.

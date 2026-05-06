@@ -1,7 +1,9 @@
 # TCP link plugin unit tests — MIT.
 include(GoogleTest)
 
-add_executable(test_tcp test_tcp.cpp)
+add_executable(test_tcp
+    test_tcp.cpp
+    test_tcp_conformance.cpp)
 target_link_libraries(test_tcp PRIVATE
     GoodNet::sdk
     goodnet_tcp_objects

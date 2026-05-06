@@ -6,7 +6,7 @@
 
 #include <gtest/gtest.h>
 
-#include <plugins/links/tcp/tcp.hpp>
+#include <tcp.hpp>
 
 #include <sdk/host_api.h>
 #include <sdk/types.h>

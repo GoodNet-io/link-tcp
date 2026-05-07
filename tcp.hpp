@@ -146,7 +146,14 @@ private:
 
     asio::io_context                                          ioc_;
     asio::executor_work_guard<asio::io_context::executor_type> work_;
-    std::thread                                                      worker_;
+    /// Multiple workers run the same `io_context` so concurrent
+    /// connections progress in parallel; per-Session strands keep
+    /// each connection's I/O serialised, so the only thing the
+    /// extra threads buy us is parallelism *across* connections.
+    /// `hardware_concurrency()/2` matches the legacy default —
+    /// half the cores leaves headroom for kernel-side
+    /// frame/encrypt work that runs on caller threads.
+    std::vector<std::thread>                                  workers_;
 
     std::optional<asio::ip::tcp::acceptor> acceptor_;
     std::atomic<std::uint16_t>                    listen_port_{0};

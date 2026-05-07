@@ -17,10 +17,12 @@
 #include <asio/write.hpp>
 #include <system_error>
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <deque>
 #include <exception>
+#include <thread>
 #include <utility>
 
 namespace gn::link::tcp {
@@ -271,7 +273,18 @@ private:
 TcpLink::TcpLink()
     : ioc_(),
       work_(asio::make_work_guard(ioc_)) {
-    worker_ = std::thread([this] { ioc_.run(); });
+    /// `hardware_concurrency()` returns 0 on platforms that cannot
+    /// determine the value; clamp to 1 so the link is always
+    /// alive. Half-the-cores splits CPU between asio I/O threads
+    /// and the kernel-side frame/encrypt work that runs on caller
+    /// threads — the legacy benchmark settled on this ratio for
+    /// the same reason.
+    const unsigned hc = std::thread::hardware_concurrency();
+    const unsigned n  = std::max(1u, hc / 2);
+    workers_.reserve(n);
+    for (unsigned i = 0; i < n; ++i) {
+        workers_.emplace_back([this] { ioc_.run(); });
+    }
 }
 
 TcpLink::~TcpLink() {
@@ -740,7 +753,10 @@ void TcpLink::shutdown() {
 
     work_.reset();
     ioc_.stop();
-    if (worker_.joinable()) worker_.join();
+    for (auto& w : workers_) {
+        if (w.joinable()) w.join();
+    }
+    workers_.clear();
 }
 
 } // namespace gn::link::tcp

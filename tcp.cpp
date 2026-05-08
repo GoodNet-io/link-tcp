@@ -14,16 +14,20 @@
 #include <asio/ip/v6_only.hpp>
 #include <asio/post.hpp>
 #include <asio/read.hpp>
+#include <asio/steady_timer.hpp>
 #include <asio/write.hpp>
 #include <system_error>
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstring>
 #include <deque>
 #include <exception>
+#include <optional>
 #include <thread>
 #include <utility>
+#include <vector>
 
 namespace gn::link::tcp {
 namespace {
@@ -88,6 +92,29 @@ public:
                             if (rc == GN_OK) {
                                 self->host_api_failures_.store(
                                     0, std::memory_order_relaxed);
+                            } else if (rc == GN_ERR_LIMIT_REACHED) {
+                                /// Receiver-side backpressure — the
+                                /// kernel session's recv buffer is
+                                /// momentarily full. Bytes are
+                                /// **rejected** (not buffered) per
+                                /// `session.cpp:349`, so re-arming
+                                /// the read immediately would lose
+                                /// the next chunk and break the AEAD
+                                /// nonce sequence. Park the rejected
+                                /// chunk and schedule a strand-bound
+                                /// retry; the read loop pauses until
+                                /// the kernel drains. `LIMIT_REACHED`
+                                /// is **not** counted toward
+                                /// `host_api_failures_` — it is
+                                /// transient backpressure, not a
+                                /// hostile feed.
+                                self->host_api_failures_.store(
+                                    0, std::memory_order_relaxed);
+                                self->stalled_inbound_.assign(
+                                    self->read_buf_.data(),
+                                    self->read_buf_.data() + n);
+                                self->retry_stalled_inbound();
+                                return;  /// don't re-arm read
                             } else {
                                 const auto fails =
                                     self->host_api_failures_.fetch_add(
@@ -106,6 +133,50 @@ public:
                     }
                     self->start_read();
                 }));
+    }
+
+    /// Schedule a strand-bound retry for the parked
+    /// `stalled_inbound_` bytes. Called from the read loop on
+    /// `LIMIT_REACHED` and from itself when retry still hits the
+    /// recv-buffer cap. On success the read loop re-arms; on
+    /// non-LIMIT_REACHED failure the connection tears down via
+    /// the standard host_api_failures_ threshold (LIMIT_REACHED
+    /// is transient, every other rc counts).
+    void retry_stalled_inbound() {
+        if (!retry_timer_) {
+            retry_timer_.emplace(strand_);
+        }
+        retry_timer_->expires_after(std::chrono::microseconds(100));
+        retry_timer_->async_wait(asio::bind_executor(strand_,
+            [self = shared_from_this()](const std::error_code& ec) {
+                if (ec) return;
+                auto t = self->transport_.lock();
+                if (!t || !t->api_ || !t->api_->notify_inbound_bytes) return;
+                if (self->stalled_inbound_.empty()) {
+                    self->start_read();
+                    return;
+                }
+                const gn_result_t rc =
+                    t->api_->notify_inbound_bytes(
+                        t->api_->host_ctx, self->conn_id,
+                        self->stalled_inbound_.data(),
+                        self->stalled_inbound_.size());
+                if (rc == GN_ERR_LIMIT_REACHED) {
+                    /// Kernel still saturated — wait again.
+                    self->retry_stalled_inbound();
+                    return;
+                }
+                /// `GN_OK` or other failure — bytes are now off
+                /// the parking slot. On non-OK we don't count
+                /// toward `host_api_failures_` here because the
+                /// retry path doesn't have the read-loop's chunk
+                /// context; the next live read will re-arm the
+                /// counter properly.
+                self->stalled_inbound_.clear();
+                self->host_api_failures_.store(
+                    0, std::memory_order_relaxed);
+                self->start_read();
+            }));
     }
 
     /// Enqueue a payload onto the strand-bound write queue and kick
@@ -263,9 +334,27 @@ private:
     std::atomic<std::uint64_t>                                bytes_buffered_{0};
     std::atomic<bool>                                         soft_signaled_{false};
     /// Counter of consecutive non-OK results from
-    /// `notify_inbound_bytes`. Reset to 0 on every OK return; the
-    /// session disconnects when it crosses the threshold (16).
+    /// `notify_inbound_bytes`. Reset to 0 on every OK return or
+    /// transient `LIMIT_REACHED` (handled by the parked-retry
+    /// path); the session disconnects when it crosses the
+    /// threshold (16) on real failures.
     std::atomic<std::uint32_t>                                host_api_failures_{0};
+
+    /// Bytes the kernel session rejected with `LIMIT_REACHED` on
+    /// the previous `notify_inbound_bytes` — typically the per-
+    /// session recv buffer momentarily exceeded its cap because
+    /// the peer's send-side `CryptoWorkerPool` drainer dumped a
+    /// big batch faster than this side's decrypt + dispatch
+    /// pipeline consumed it. Held strand-locally and retried
+    /// through `retry_stalled_inbound` on a 100µs strand timer
+    /// so the read loop pauses without losing the chunk.
+    std::vector<std::uint8_t>                                 stalled_inbound_;
+
+    /// Strand-bound retry timer for `stalled_inbound_`. Lazy-
+    /// initialised on first stall — most sessions never trigger
+    /// receiver-side backpressure and pay no per-session timer
+    /// overhead.
+    std::optional<asio::steady_timer>                         retry_timer_;
 };
 
 // ── TcpLink ──────────────────────────────────────────────────────────────

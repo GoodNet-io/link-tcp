@@ -760,6 +760,31 @@ gn_result_t TcpLink::disconnect(gn_conn_id_t conn) {
     return GN_OK;
 }
 
+/// L2-composition foundation per `link.en.md` §8. Stubs return
+/// `GN_ERR_NOT_IMPLEMENTED`; real implementation lands in the
+/// branch that consumes them (e.g. `feat/link-ws-on-tcp` for
+/// composer_listen/connect/subscribe_data wired against an L2
+/// composer plugin's flow).
+gn_result_t TcpLink::composer_listen(std::string_view /*uri*/) {
+    return GN_ERR_NOT_IMPLEMENTED;
+}
+
+gn_result_t TcpLink::composer_connect(std::string_view /*uri*/,
+                                       gn_conn_id_t* out_conn) {
+    if (out_conn) *out_conn = GN_INVALID_ID;
+    return GN_ERR_NOT_IMPLEMENTED;
+}
+
+gn_result_t TcpLink::composer_subscribe_data(gn_conn_id_t /*conn*/,
+                                              ::gn_link_data_cb_t /*cb*/,
+                                              void* /*user_data*/) {
+    return GN_ERR_NOT_IMPLEMENTED;
+}
+
+gn_result_t TcpLink::composer_unsubscribe_data(gn_conn_id_t /*conn*/) {
+    return GN_ERR_NOT_IMPLEMENTED;
+}
+
 void TcpLink::register_session(gn_conn_id_t id,
                                      std::shared_ptr<Session> s)
 {

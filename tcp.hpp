@@ -78,6 +78,36 @@ public:
     /// Idempotent close. A second call returns GN_OK no-op.
     [[nodiscard]] gn_result_t disconnect(gn_conn_id_t conn);
 
+    /// L2-composition surface per `link.en.md` §8. Composer (WSS,
+    /// TLS, ICE — built on this L1) drives connection lifecycle
+    /// independently of the kernel `notify_connect` flow.
+    ///
+    /// `composer_listen(uri)` binds an L1 listener; accepted
+    /// connections are kept in the composer-owned session set and
+    /// **not** announced to the kernel. The composer attaches
+    /// per-conn data callbacks through `composer_subscribe_data`.
+    ///
+    /// `composer_connect(uri, &out)` initiates an outbound L1 conn
+    /// the composer owns. The L2 plugin then runs its handshake,
+    /// finally calls `host_api->notify_connect` for the L2 conn it
+    /// publishes upward.
+    ///
+    /// Composer-owned conn ids are issued from a private range
+    /// (high bit set) so they cannot collide with kernel-managed
+    /// ids. `send` / `disconnect` route to the composer session set
+    /// when the id is in that range.
+    ///
+    /// Foundation step: stub bodies return GN_ERR_NOT_IMPLEMENTED;
+    /// real composer flow lands per top-half plugin (WSS, TLS, ICE).
+    [[nodiscard]] gn_result_t composer_listen(std::string_view uri);
+    [[nodiscard]] gn_result_t composer_connect(std::string_view uri,
+                                                gn_conn_id_t* out_conn);
+    [[nodiscard]] gn_result_t composer_subscribe_data(
+        gn_conn_id_t conn,
+        ::gn_link_data_cb_t cb,
+        void* user_data);
+    [[nodiscard]] gn_result_t composer_unsubscribe_data(gn_conn_id_t conn);
+
     /// Bind the kernel-provided host_api; subsequent
     /// `notify_*` calls flow through it. Pass `nullptr` to detach
     /// before destruction.

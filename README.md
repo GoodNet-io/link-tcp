@@ -30,9 +30,9 @@ cmake --build build
 The kernel's `PluginManager` opens the `.so` from a manifest entry
 that pins its SHA-256 digest; the plugin registers the `tcp` scheme
 through `gn_plugin_init`. See `docs/install.md` and
-`docs/contracts/plugin-manifest.md` in the kernel tree.
+`docs/contracts/plugin-manifest.en.md` in the kernel tree.
 
 ## Contract
 
-- Kernel-side link contract: `docs/contracts/link.md`
-- Trust-class policy: `docs/contracts/security-trust.md`
+- Kernel-side link contract: `docs/contracts/link.en.md`
+- Trust-class policy: `docs/contracts/security-trust.en.md`

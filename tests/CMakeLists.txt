@@ -3,7 +3,8 @@ include(GoogleTest)
 
 add_executable(test_tcp
     test_tcp.cpp
-    test_tcp_conformance.cpp)
+    test_tcp_conformance.cpp
+    test_composer.cpp)
 target_link_libraries(test_tcp PRIVATE
     GoodNet::sdk
     goodnet_tcp_objects

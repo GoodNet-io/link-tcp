@@ -357,6 +357,120 @@ private:
     std::optional<asio::steady_timer>                         retry_timer_;
 };
 
+// ── ComposerSession ──────────────────────────────────────────────────────
+//
+// Composer-mode session: raw byte stream feeding back through a
+// caller-installed `gn_link_data_cb_t`. No `notify_connect` /
+// `notify_disconnect` traffic — the composer owns conn lifecycle
+// per `link.en.md` §8 accept-bus contract. Compared with the
+// kernel-managed `Session` above this class is intentionally lean:
+// no Noise pipeline awareness, no host_api_failures retry threshold,
+// no stalled-recv-buffer parking. The composer (WSS / TLS / ICE)
+// applies its own back-pressure on top of the byte stream.
+class TcpLink::ComposerSession
+    : public std::enable_shared_from_this<ComposerSession> {
+public:
+    ComposerSession(asio::ip::tcp::socket sock,
+                    std::weak_ptr<TcpLink> transport,
+                    gn_conn_id_t id)
+        : socket_(std::move(sock)),
+          strand_(socket_.get_executor()),
+          transport_(std::move(transport)),
+          conn_id_(id) {}
+
+    [[nodiscard]] gn_conn_id_t conn_id() const noexcept { return conn_id_; }
+    asio::ip::tcp::socket&     socket() noexcept        { return socket_; }
+
+    void start_read() {
+        socket_.async_read_some(
+            asio::buffer(read_buf_),
+            asio::bind_executor(strand_,
+                [self = shared_from_this()](
+                    const std::error_code& ec, std::size_t n) {
+                    auto t = self->transport_.lock();
+                    if (!t) return;
+                    if (ec) {
+                        // Composer owns lifecycle; let the data_sub
+                        // discover the close by socket EOF on the
+                        // next write attempt, and drop the session
+                        // record. The composer plugin will detect
+                        // teardown through its own framing layer.
+                        t->composer_drop_session(self->conn_id_);
+                        return;
+                    }
+                    if (n > 0) {
+                        t->bytes_in_.fetch_add(n, std::memory_order_relaxed);
+                        t->frames_in_.fetch_add(1, std::memory_order_relaxed);
+                        t->composer_dispatch_data(
+                            self->conn_id_, self->read_buf_.data(), n);
+                    }
+                    self->start_read();
+                }));
+    }
+
+    void do_send(std::span<const std::uint8_t> bytes) {
+        // Single-writer invariant per link.md §4: every async_write
+        // runs on the strand; queue any concurrent send so the prior
+        // write completes first.
+        std::vector<std::uint8_t> payload(bytes.begin(), bytes.end());
+        asio::post(strand_,
+            [self = shared_from_this(),
+             payload = std::move(payload)]() mutable {
+                self->write_queue_.push_back(std::move(payload));
+                if (self->write_queue_.size() == 1) {
+                    self->kick_write();
+                }
+            });
+    }
+
+    void do_close() {
+        asio::post(strand_,
+            [self = shared_from_this()]() {
+                std::error_code ec;
+                (void)self->socket_.shutdown(
+                    asio::ip::tcp::socket::shutdown_both, ec);
+                (void)self->socket_.close(ec);
+            });
+    }
+
+private:
+    void kick_write() {
+        if (write_queue_.empty()) return;
+        auto& front = write_queue_.front();
+        asio::async_write(
+            socket_,
+            asio::buffer(front),
+            asio::bind_executor(strand_,
+                [self = shared_from_this()](
+                    const std::error_code& ec, std::size_t n) {
+                    auto t = self->transport_.lock();
+                    if (t && !ec) {
+                        t->bytes_out_.fetch_add(
+                            n, std::memory_order_relaxed);
+                        t->frames_out_.fetch_add(
+                            1, std::memory_order_relaxed);
+                    }
+                    if (!self->write_queue_.empty()) {
+                        self->write_queue_.pop_front();
+                    }
+                    if (ec) {
+                        if (t) t->composer_drop_session(self->conn_id_);
+                        return;
+                    }
+                    if (!self->write_queue_.empty()) {
+                        self->kick_write();
+                    }
+                }));
+    }
+
+    asio::ip::tcp::socket                                       socket_;
+    asio::strand<asio::ip::tcp::socket::executor_type>          strand_;
+    std::weak_ptr<TcpLink>                                      transport_;
+    gn_conn_id_t                                                conn_id_;
+    std::array<std::uint8_t, 64 * 1024>                         read_buf_{};
+    std::deque<std::vector<std::uint8_t>>                       write_queue_;
+};
+
 // ── TcpLink ──────────────────────────────────────────────────────────────
 
 TcpLink::TcpLink()
@@ -695,6 +809,17 @@ gn_result_t TcpLink::connect(std::string_view uri_sv) {
 gn_result_t TcpLink::send(gn_conn_id_t conn,
                                 std::span<const std::uint8_t> bytes)
 {
+    if (conn & kComposerIdBit) {
+        std::shared_ptr<ComposerSession> cs;
+        {
+            std::lock_guard lk(composer_mu_);
+            auto it = composer_sessions_.find(conn);
+            if (it == composer_sessions_.end()) return GN_ERR_NOT_FOUND;
+            cs = it->second;
+        }
+        cs->do_send(bytes);
+        return GN_OK;
+    }
     auto session = find_session(conn);
     if (!session) return GN_ERR_NOT_FOUND;
     if (pending_queue_bytes_hard_ != 0 &&
@@ -724,6 +849,16 @@ gn_result_t TcpLink::send_batch(
     if (frames.empty()) return GN_OK;
     if (frames.size() == 1) return send(conn, frames[0]);
 
+    if (conn & kComposerIdBit) {
+        // Coalesce the batch into one send for the composer path —
+        // the composer's framing layer applies its own MTU policy.
+        std::vector<std::uint8_t> flat;
+        std::size_t total = 0;
+        for (const auto& f : frames) total += f.size();
+        flat.reserve(total);
+        for (const auto& f : frames) flat.insert(flat.end(), f.begin(), f.end());
+        return send(conn, std::span<const std::uint8_t>(flat));
+    }
     auto session = find_session(conn);
     if (!session) return GN_ERR_NOT_FOUND;
     std::size_t total = 0;
@@ -748,6 +883,19 @@ gn_result_t TcpLink::send_batch(
 }
 
 gn_result_t TcpLink::disconnect(gn_conn_id_t conn) {
+    if (conn & kComposerIdBit) {
+        std::shared_ptr<ComposerSession> cs;
+        {
+            std::lock_guard lk(composer_mu_);
+            auto it = composer_sessions_.find(conn);
+            if (it == composer_sessions_.end()) return GN_OK;  /// idempotent
+            cs = std::move(it->second);
+            composer_sessions_.erase(it);
+            composer_data_subs_.erase(conn);
+        }
+        cs->do_close();
+        return GN_OK;
+    }
     std::shared_ptr<Session> session;
     {
         std::lock_guard lk(sessions_mu_);
@@ -760,29 +908,187 @@ gn_result_t TcpLink::disconnect(gn_conn_id_t conn) {
     return GN_OK;
 }
 
-/// L2-composition foundation per `link.en.md` §8. Stubs return
-/// `GN_ERR_NOT_IMPLEMENTED`; real implementation lands in the
-/// branch that consumes them (e.g. `feat/link-ws-on-tcp` for
-/// composer_listen/connect/subscribe_data wired against an L2
-/// composer plugin's flow).
-gn_result_t TcpLink::composer_listen(std::string_view /*uri*/) {
-    return GN_ERR_NOT_IMPLEMENTED;
+// ── Composer L2 surface ─────────────────────────────────────────────────
+//
+// Implements `link.en.md` §8 accept-bus contract. Disjoint from the
+// kernel-managed acceptor / sessions above: composer conns are owned
+// by the consumer plugin (WSS, TLS, ICE) and never thread through
+// `notify_connect`. The high bit of `conn_id` (`kComposerIdBit`)
+// keeps composer ids segregated from the kernel-managed range so
+// `send` / `disconnect` route by id mask without scanning two maps.
+
+gn_result_t TcpLink::composer_listen(std::string_view uri) {
+    if (shutdown_.load(std::memory_order_acquire)) {
+        return GN_ERR_INVALID_STATE;
+    }
+    if (composer_acceptor_) return GN_ERR_LIMIT_REACHED;
+
+    const auto parts = ::gn::parse_uri(uri);
+    if (!parts || parts->is_path_style()) return GN_ERR_INVALID_ENVELOPE;
+    if (parts->scheme != "tcp") return GN_ERR_INVALID_ENVELOPE;
+
+    std::error_code ec;
+    auto addr = asio::ip::make_address(parts->host, ec);
+    if (ec) return GN_ERR_INVALID_ENVELOPE;
+    asio::ip::tcp::endpoint endpoint(addr, parts->port);
+
+    composer_acceptor_.emplace(ioc_);
+    composer_acceptor_->open(endpoint.protocol(), ec);
+    if (ec) { composer_acceptor_.reset(); return GN_ERR_NULL_ARG; }
+    composer_acceptor_->set_option(
+        asio::socket_base::reuse_address(true), ec);
+    if (endpoint.protocol() == asio::ip::tcp::v6()) {
+        composer_acceptor_->set_option(asio::ip::v6_only(false), ec);
+    }
+    composer_acceptor_->bind(endpoint, ec);
+    if (ec) { composer_acceptor_.reset(); return GN_ERR_NULL_ARG; }
+    composer_acceptor_->listen(asio::socket_base::max_listen_connections, ec);
+    if (ec) { composer_acceptor_.reset(); return GN_ERR_NULL_ARG; }
+
+    // Publish the bound port through `listen_port_` so callers can
+    // discover the OS-picked port (URI port 0). The kernel `listen`
+    // and the composer `listen` share this counter — both paths fill
+    // in the actual OS-assigned port for whichever acceptor opened.
+    const auto bound = composer_acceptor_->local_endpoint(ec);
+    if (!ec) {
+        listen_port_.store(bound.port(), std::memory_order_release);
+    }
+
+    composer_start_accept();
+    return GN_OK;
 }
 
-gn_result_t TcpLink::composer_connect(std::string_view /*uri*/,
+gn_result_t TcpLink::composer_connect(std::string_view uri,
                                        gn_conn_id_t* out_conn) {
-    if (out_conn) *out_conn = GN_INVALID_ID;
-    return GN_ERR_NOT_IMPLEMENTED;
+    if (!out_conn) return GN_ERR_NULL_ARG;
+    *out_conn = GN_INVALID_ID;
+    if (shutdown_.load(std::memory_order_acquire)) {
+        return GN_ERR_INVALID_STATE;
+    }
+
+    const auto parts = ::gn::parse_uri(uri);
+    if (!parts || parts->is_path_style()) return GN_ERR_INVALID_ENVELOPE;
+    if (parts->scheme != "tcp") return GN_ERR_INVALID_ENVELOPE;
+
+    std::error_code ec;
+    auto addr = asio::ip::make_address(parts->host, ec);
+    if (ec) return GN_ERR_INVALID_ENVELOPE;
+    asio::ip::tcp::endpoint endpoint(addr, parts->port);
+
+    asio::ip::tcp::socket sock(ioc_);
+    sock.connect(endpoint, ec);
+    if (ec) return GN_ERR_NOT_FOUND;
+
+    const gn_conn_id_t id =
+        next_composer_id_.fetch_add(1, std::memory_order_relaxed) |
+        kComposerIdBit;
+    auto cs = std::make_shared<ComposerSession>(
+        std::move(sock), weak_from_this(), id);
+    {
+        std::lock_guard lk(composer_mu_);
+        composer_sessions_[id] = cs;
+    }
+    cs->start_read();
+    *out_conn = id;
+    return GN_OK;
 }
 
-gn_result_t TcpLink::composer_subscribe_data(gn_conn_id_t /*conn*/,
-                                              ::gn_link_data_cb_t /*cb*/,
-                                              void* /*user_data*/) {
-    return GN_ERR_NOT_IMPLEMENTED;
+gn_result_t TcpLink::composer_subscribe_data(gn_conn_id_t conn,
+                                              ::gn_link_data_cb_t cb,
+                                              void* user_data) {
+    if (!cb) return GN_ERR_NULL_ARG;
+    if (!(conn & kComposerIdBit)) return GN_ERR_NOT_FOUND;
+    std::lock_guard lk(composer_mu_);
+    if (composer_sessions_.find(conn) == composer_sessions_.end()) {
+        return GN_ERR_NOT_FOUND;
+    }
+    composer_data_subs_[conn] = ComposerDataSub{cb, user_data};
+    return GN_OK;
 }
 
-gn_result_t TcpLink::composer_unsubscribe_data(gn_conn_id_t /*conn*/) {
-    return GN_ERR_NOT_IMPLEMENTED;
+gn_result_t TcpLink::composer_unsubscribe_data(gn_conn_id_t conn) {
+    if (!(conn & kComposerIdBit)) return GN_OK;
+    std::lock_guard lk(composer_mu_);
+    composer_data_subs_.erase(conn);
+    return GN_OK;
+}
+
+gn_result_t TcpLink::composer_subscribe_accept(
+    ::gn_link_accept_cb_t cb,
+    void* user_data,
+    gn_subscription_id_t* out_token) {
+    if (!cb || !out_token) return GN_ERR_NULL_ARG;
+    const gn_subscription_id_t token =
+        next_accept_token_.fetch_add(1, std::memory_order_relaxed);
+    std::lock_guard lk(composer_mu_);
+    composer_accept_subs_.push_back(
+        ComposerAcceptSub{token, cb, user_data});
+    *out_token = token;
+    return GN_OK;
+}
+
+gn_result_t TcpLink::composer_unsubscribe_accept(
+    gn_subscription_id_t token) {
+    std::lock_guard lk(composer_mu_);
+    auto it = std::remove_if(
+        composer_accept_subs_.begin(), composer_accept_subs_.end(),
+        [token](const ComposerAcceptSub& s) { return s.token == token; });
+    composer_accept_subs_.erase(it, composer_accept_subs_.end());
+    return GN_OK;
+}
+
+void TcpLink::composer_start_accept() {
+    if (!composer_acceptor_) return;
+    auto sock = std::make_shared<asio::ip::tcp::socket>(ioc_);
+    composer_acceptor_->async_accept(
+        *sock,
+        [self = weak_from_this(), sock](const std::error_code& ec) {
+            auto t = self.lock();
+            if (!t) return;
+            if (ec) return;  // acceptor closed during shutdown
+            // Snapshot the peer endpoint before moving the socket
+            std::error_code peer_ec;
+            auto ep = sock->remote_endpoint(peer_ec);
+            const std::string peer_uri =
+                peer_ec ? std::string{} : endpoint_to_uri(ep);
+            const gn_conn_id_t id =
+                t->next_composer_id_.fetch_add(
+                    1, std::memory_order_relaxed) | kComposerIdBit;
+            auto cs = std::make_shared<ComposerSession>(
+                std::move(*sock), t->weak_from_this(), id);
+            std::vector<ComposerAcceptSub> snapshot;
+            {
+                std::lock_guard lk(t->composer_mu_);
+                t->composer_sessions_[id] = cs;
+                snapshot = t->composer_accept_subs_;  // copy out for fan-out
+            }
+            cs->start_read();
+            for (const auto& s : snapshot) {
+                if (s.cb) {
+                    s.cb(s.user_data, id, peer_uri.c_str());
+                }
+            }
+            t->composer_start_accept();
+        });
+}
+
+void TcpLink::composer_dispatch_data(gn_conn_id_t conn,
+                                      const std::uint8_t* bytes,
+                                      std::size_t size) {
+    ComposerDataSub sub{};
+    {
+        std::lock_guard lk(composer_mu_);
+        auto it = composer_data_subs_.find(conn);
+        if (it == composer_data_subs_.end()) return;
+        sub = it->second;
+    }
+    if (sub.cb) sub.cb(sub.user_data, conn, bytes, size);
+}
+
+void TcpLink::composer_drop_session(gn_conn_id_t conn) {
+    std::lock_guard lk(composer_mu_);
+    composer_sessions_.erase(conn);
+    composer_data_subs_.erase(conn);
 }
 
 void TcpLink::register_session(gn_conn_id_t id,
@@ -825,6 +1131,29 @@ void TcpLink::shutdown() {
         }
         acceptor_.reset();
     }
+
+    // Composer-mode teardown. Close the composer acceptor first so
+    // no new conns arrive mid-shutdown, then close every live
+    // composer session and clear all per-conn subscriptions. The
+    // accept-bus subscribers stay registered until the consumer
+    // plugin explicitly unsubscribes — we just stop firing them.
+    if (composer_acceptor_) {
+        std::error_code cec;
+        (void)composer_acceptor_->close(cec);
+        composer_acceptor_.reset();
+    }
+    std::vector<std::shared_ptr<ComposerSession>> composer_drain;
+    {
+        std::lock_guard lk(composer_mu_);
+        composer_drain.reserve(composer_sessions_.size());
+        for (auto& [_, cs] : composer_sessions_) {
+            composer_drain.push_back(cs);
+        }
+        composer_sessions_.clear();
+        composer_data_subs_.clear();
+        composer_accept_subs_.clear();
+    }
+    for (auto& cs : composer_drain) cs->do_close();
 
     /// Drain every ever-published conn id through notify_disconnect on
     /// the caller thread before stopping the io_context. The

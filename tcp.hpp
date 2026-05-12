@@ -97,8 +97,11 @@ public:
     /// ids. `send` / `disconnect` route to the composer session set
     /// when the id is in that range.
     ///
-    /// Foundation step: stub bodies return GN_ERR_NOT_IMPLEMENTED;
-    /// real composer flow lands per top-half plugin (WSS, TLS, ICE).
+    /// Composer L2 surface. Used by upper-layer plugins (WSS, TLS,
+    /// ICE) that want to own L1 conn lifecycle without engaging the
+    /// kernel's `notify_connect` flow. Composer conn ids carry
+    /// `kComposerIdBit` so `send` / `disconnect` route by range
+    /// without scanning two maps.
     [[nodiscard]] gn_result_t composer_listen(std::string_view uri);
     [[nodiscard]] gn_result_t composer_connect(std::string_view uri,
                                                 gn_conn_id_t* out_conn);
@@ -107,6 +110,18 @@ public:
         ::gn_link_data_cb_t cb,
         void* user_data);
     [[nodiscard]] gn_result_t composer_unsubscribe_data(gn_conn_id_t conn);
+    [[nodiscard]] gn_result_t composer_subscribe_accept(
+        ::gn_link_accept_cb_t cb,
+        void* user_data,
+        gn_subscription_id_t* out_token);
+    [[nodiscard]] gn_result_t composer_unsubscribe_accept(
+        gn_subscription_id_t token);
+
+    /// High-bit flag distinguishing composer-owned conn ids from
+    /// kernel-managed ones. Composer ids never collide because the
+    /// composer allocator counts up from 1 inside its own range.
+    static constexpr gn_conn_id_t kComposerIdBit =
+        gn_conn_id_t{1} << 63;
 
     /// Bind the kernel-provided host_api; subsequent
     /// `notify_*` calls flow through it. Pass `nullptr` to detach
@@ -141,6 +156,17 @@ public:
 
 private:
     class Session;
+    class ComposerSession;
+
+    struct ComposerDataSub {
+        ::gn_link_data_cb_t cb        = nullptr;
+        void*               user_data = nullptr;
+    };
+    struct ComposerAcceptSub {
+        gn_subscription_id_t  token     = GN_INVALID_SUBSCRIPTION_ID;
+        ::gn_link_accept_cb_t cb        = nullptr;
+        void*                 user_data = nullptr;
+    };
 
     /// Compute trust class from a remote endpoint per
     /// `link.md` §3: loopback addresses → `Loopback`, public →
@@ -216,6 +242,27 @@ private:
     std::uint64_t pending_queue_bytes_hard_ = 0;
 
     const host_api_t* api_ = nullptr;
+
+    /// Composer-mode state — disjoint from the kernel-managed
+    /// session set above. Composer conn ids carry `kComposerIdBit`;
+    /// `send` / `disconnect` dispatch by range so the two worlds
+    /// never share a map.
+    std::optional<asio::ip::tcp::acceptor> composer_acceptor_;
+    mutable std::mutex                                                composer_mu_;
+    std::unordered_map<gn_conn_id_t,
+                       std::shared_ptr<ComposerSession>>              composer_sessions_;
+    std::unordered_map<gn_conn_id_t, ComposerDataSub>                 composer_data_subs_;
+    std::vector<ComposerAcceptSub>                                    composer_accept_subs_;
+    std::atomic<std::uint64_t>                                        next_composer_id_{1};
+    std::atomic<std::uint64_t>                                        next_accept_token_{1};
+
+    void composer_start_accept();
+    void composer_on_accept(std::shared_ptr<ComposerSession> s,
+                             std::error_code ec);
+    void composer_dispatch_data(gn_conn_id_t conn,
+                                 const std::uint8_t* bytes,
+                                 std::size_t size);
+    void composer_drop_session(gn_conn_id_t conn);
 };
 
 } // namespace gn::link::tcp

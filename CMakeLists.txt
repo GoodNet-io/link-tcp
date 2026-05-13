@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.22)
 
 if(NOT TARGET GoodNet::sdk)
     project(goodnet_link_tcp
-        VERSION   0.1.0
+        VERSION   1.0.0
         LANGUAGES CXX)
     find_package(GoodNet REQUIRED)
     include(CTest)
@@ -21,6 +21,7 @@ endif()
 
 add_library(goodnet_tcp_objects OBJECT
     tcp.cpp
+    tcp_composer_session.cpp
 )
 target_link_libraries(goodnet_tcp_objects PUBLIC GoodNet::sdk asio::asio Threads::Threads)
 target_compile_features(goodnet_tcp_objects PUBLIC cxx_std_23)

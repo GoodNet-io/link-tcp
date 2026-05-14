@@ -117,6 +117,11 @@ public:
     [[nodiscard]] gn_result_t composer_unsubscribe_accept(
         gn_subscription_id_t token);
 
+    /// Bound port of the composer acceptor (port 0 listen). Returns
+    /// @ref GN_ERR_INVALID_STATE when no composer-listen is active.
+    [[nodiscard]] gn_result_t composer_listen_port(
+        std::uint16_t* out_port) const noexcept;
+
     /// High-bit flag distinguishing composer-owned conn ids from
     /// kernel-managed ones. Composer ids never collide because the
     /// composer allocator counts up from 1 inside its own range.

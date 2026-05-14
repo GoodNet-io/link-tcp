@@ -3,6 +3,7 @@
 /// @brief  TCP link plugin — Boost.Asio strand-per-session transport.
 
 #include "tcp.hpp"
+#include "tcp_composer_session.hpp"
 
 #include <sdk/convenience.h>
 #include <sdk/cpp/dns.hpp>
@@ -362,114 +363,9 @@ private:
 // Composer-mode session: raw byte stream feeding back through a
 // caller-installed `gn_link_data_cb_t`. No `notify_connect` /
 // `notify_disconnect` traffic — the composer owns conn lifecycle
-// per `link.en.md` §8 accept-bus contract. Compared with the
-// kernel-managed `Session` above this class is intentionally lean:
-// no Noise pipeline awareness, no host_api_failures retry threshold,
-// no stalled-recv-buffer parking. The composer (WSS / TLS / ICE)
-// applies its own back-pressure on top of the byte stream.
-class TcpLink::ComposerSession
-    : public std::enable_shared_from_this<ComposerSession> {
-public:
-    ComposerSession(asio::ip::tcp::socket sock,
-                    std::weak_ptr<TcpLink> transport,
-                    gn_conn_id_t id)
-        : socket_(std::move(sock)),
-          strand_(socket_.get_executor()),
-          transport_(std::move(transport)),
-          conn_id_(id) {}
-
-    [[nodiscard]] gn_conn_id_t conn_id() const noexcept { return conn_id_; }
-    asio::ip::tcp::socket&     socket() noexcept        { return socket_; }
-
-    void start_read() {
-        socket_.async_read_some(
-            asio::buffer(read_buf_),
-            asio::bind_executor(strand_,
-                [self = shared_from_this()](
-                    const std::error_code& ec, std::size_t n) {
-                    auto t = self->transport_.lock();
-                    if (!t) return;
-                    if (ec) {
-                        // Composer owns lifecycle; let the data_sub
-                        // discover the close by socket EOF on the
-                        // next write attempt, and drop the session
-                        // record. The composer plugin will detect
-                        // teardown through its own framing layer.
-                        t->composer_drop_session(self->conn_id_);
-                        return;
-                    }
-                    if (n > 0) {
-                        t->bytes_in_.fetch_add(n, std::memory_order_relaxed);
-                        t->frames_in_.fetch_add(1, std::memory_order_relaxed);
-                        t->composer_dispatch_data(
-                            self->conn_id_, self->read_buf_.data(), n);
-                    }
-                    self->start_read();
-                }));
-    }
-
-    void do_send(std::span<const std::uint8_t> bytes) {
-        // Single-writer invariant per link.md §4: every async_write
-        // runs on the strand; queue any concurrent send so the prior
-        // write completes first.
-        std::vector<std::uint8_t> payload(bytes.begin(), bytes.end());
-        asio::post(strand_,
-            [self = shared_from_this(),
-             payload = std::move(payload)]() mutable {
-                self->write_queue_.push_back(std::move(payload));
-                if (self->write_queue_.size() == 1) {
-                    self->kick_write();
-                }
-            });
-    }
-
-    void do_close() {
-        asio::post(strand_,
-            [self = shared_from_this()]() {
-                std::error_code ec;
-                (void)self->socket_.shutdown(
-                    asio::ip::tcp::socket::shutdown_both, ec);
-                (void)self->socket_.close(ec);
-            });
-    }
-
-private:
-    void kick_write() {
-        if (write_queue_.empty()) return;
-        auto& front = write_queue_.front();
-        asio::async_write(
-            socket_,
-            asio::buffer(front),
-            asio::bind_executor(strand_,
-                [self = shared_from_this()](
-                    const std::error_code& ec, std::size_t n) {
-                    auto t = self->transport_.lock();
-                    if (t && !ec) {
-                        t->bytes_out_.fetch_add(
-                            n, std::memory_order_relaxed);
-                        t->frames_out_.fetch_add(
-                            1, std::memory_order_relaxed);
-                    }
-                    if (!self->write_queue_.empty()) {
-                        self->write_queue_.pop_front();
-                    }
-                    if (ec) {
-                        if (t) t->composer_drop_session(self->conn_id_);
-                        return;
-                    }
-                    if (!self->write_queue_.empty()) {
-                        self->kick_write();
-                    }
-                }));
-    }
-
-    asio::ip::tcp::socket                                       socket_;
-    asio::strand<asio::ip::tcp::socket::executor_type>          strand_;
-    std::weak_ptr<TcpLink>                                      transport_;
-    gn_conn_id_t                                                conn_id_;
-    std::array<std::uint8_t, 64 * 1024>                         read_buf_{};
-    std::deque<std::vector<std::uint8_t>>                       write_queue_;
-};
+// per `link.en.md` §8 accept-bus contract. Definition lives in
+// `tcp_composer_session.{hpp,cpp}` (split out so the composer L1
+// path evolves independently of the kernel-managed Session).
 
 // ── TcpLink ──────────────────────────────────────────────────────────────
 
@@ -1037,6 +933,18 @@ gn_result_t TcpLink::composer_unsubscribe_accept(
     return GN_OK;
 }
 
+gn_result_t TcpLink::composer_listen_port(
+    std::uint16_t* out_port) const noexcept {
+    if (!out_port) return GN_ERR_NULL_ARG;
+    *out_port = 0;
+    if (!composer_acceptor_) return GN_ERR_INVALID_STATE;
+    std::error_code ec;
+    const auto ep = composer_acceptor_->local_endpoint(ec);
+    if (ec) return GN_ERR_INVALID_STATE;
+    *out_port = ep.port();
+    return GN_OK;
+}
+
 void TcpLink::composer_start_accept() {
     if (!composer_acceptor_) return;
     auto sock = std::make_shared<asio::ip::tcp::socket>(ioc_);
@@ -1062,12 +970,17 @@ void TcpLink::composer_start_accept() {
                 t->composer_sessions_[id] = cs;
                 snapshot = t->composer_accept_subs_;  // copy out for fan-out
             }
-            cs->start_read();
+            // Fire accept-bus subscribers BEFORE starting the read
+            // loop so a composer (WS / TLS / ICE) gets a chance to
+            // install its data subscription before the first byte
+            // races onto the strand. composer_dispatch_data drops
+            // bytes silently when no sub is registered.
             for (const auto& s : snapshot) {
                 if (s.cb) {
                     s.cb(s.user_data, id, peer_uri.c_str());
                 }
             }
+            cs->start_read();
             t->composer_start_accept();
         });
 }

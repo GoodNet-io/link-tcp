@@ -8,14 +8,17 @@
 
 #include <tcp.hpp>
 
+#include <sdk/cpp/test/poll.hpp>
+#include <sdk/cpp/test/stub_host.hpp>
 #include <sdk/host_api.h>
-#include <sdk/types.h>
 #include <sdk/trust.h>
+#include <sdk/types.h>
 
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -26,80 +29,26 @@ namespace {
 using namespace std::chrono_literals;
 using gn::link::tcp::TcpLink;
 
-/// Stub host_api: the test owns its callbacks; no real kernel.
-struct StubHost {
-    std::atomic<int>                         connects{0};
-    std::atomic<int>                         disconnects{0};
-    std::atomic<int>                         inbound_calls{0};
-    std::mutex                               mu;
-    std::vector<gn_conn_id_t>                conns;
-    std::vector<gn_handshake_role_t>         roles;
-    std::vector<std::vector<std::uint8_t>>   inbound;        // by conn_id index
-    std::vector<gn_conn_id_t>                inbound_owners;
+/// Alias to the shared SDK helpers (DX Tier 2, 2026-05-12).
+/// The hand-rolled `StubHost` + `make_stub_api` + `wait_for` copies
+/// that used to live here at 78 LOC are now centralised in
+/// `sdk/cpp/test/stub_host.hpp` and `sdk/cpp/test/poll.hpp`.
+using StubHost = ::gn::sdk::test::LinkStub;
 
-    /// Each notify_connect allocates a fresh id; tests drive the
-    /// transport on whichever id matches the role they care about.
-    std::atomic<gn_conn_id_t>                next_id{1};
-
-    static gn_result_t on_connect(void* host_ctx,
-                                   const std::uint8_t /*remote_pk*/[GN_PUBLIC_KEY_BYTES],
-                                   const char* /*uri*/,
-                                   gn_trust_class_t /*trust*/,
-                                   gn_handshake_role_t role,
-                                   gn_conn_id_t* out_conn) {
-        auto* h = static_cast<StubHost*>(host_ctx);
-        const auto id = h->next_id.fetch_add(1);
-        {
-            std::lock_guard lk(h->mu);
-            h->conns.push_back(id);
-            h->roles.push_back(role);
-        }
-        *out_conn = id;
-        h->connects.fetch_add(1);
-        return GN_OK;
-    }
-
-    static gn_result_t on_inbound(void* host_ctx, gn_conn_id_t conn,
-                                   const std::uint8_t* bytes, std::size_t size) {
-        auto* h = static_cast<StubHost*>(host_ctx);
-        std::lock_guard lk(h->mu);
-        h->inbound.emplace_back(bytes, bytes + size);
-        h->inbound_owners.push_back(conn);
-        h->inbound_calls.fetch_add(1);
-        return GN_OK;
-    }
-
-    static gn_result_t on_disconnect(void* host_ctx, gn_conn_id_t /*conn*/,
-                                      gn_result_t /*reason*/) {
-        auto* h = static_cast<StubHost*>(host_ctx);
-        h->disconnects.fetch_add(1);
-        return GN_OK;
-    }
-};
-
-host_api_t make_stub_api(StubHost& h) {
-    host_api_t api{};
-    api.api_size              = sizeof(host_api_t);
-    api.host_ctx              = &h;
-    api.notify_connect        = &StubHost::on_connect;
-    api.notify_inbound_bytes  = &StubHost::on_inbound;
-    api.notify_disconnect     = &StubHost::on_disconnect;
-    return api;
+inline host_api_t make_stub_api(StubHost& h) noexcept {
+    return ::gn::sdk::test::make_link_host_api(h);
 }
 
-/// Spin-poll a predicate up to `timeout` milliseconds; fail the
-/// enclosing test on timeout. Async transport completions land on
-/// the worker thread; the poller serialises observation via the
-/// supplied `StubHost`'s atomics.
-void wait_for(const std::function<bool()>& pred,
-              std::chrono::milliseconds timeout,
-              const char* what) {
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
-    while (std::chrono::steady_clock::now() < deadline) {
-        if (pred()) return;
-        std::this_thread::sleep_for(5ms);
+/// Thin wrapper that turns the SDK's boolean `wait_for` into the
+/// "fail-the-test on timeout" call-site shape this file's tests
+/// were written against. New tests should prefer
+/// `ASSERT_TRUE(gn::sdk::test::wait_for(...))` directly.
+inline void wait_for(const std::function<bool()>& pred,
+                      std::chrono::milliseconds timeout,
+                      const char* what) {
+    if (!::gn::sdk::test::wait_for(pred, timeout)) {
+        FAIL() << "timeout waiting for: " << what;
     }
-    FAIL() << "timeout waiting for: " << what;
 }
 
 }  // namespace

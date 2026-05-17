@@ -8,11 +8,11 @@
 /// no-ops instead of UAF (per audit TR-C1 lesson). Per-session strand
 /// keeps the single-writer invariant from `link.en.md` §4: every
 /// `async_write` runs on the strand, every close dispatches through
-/// it (closes the socket while the read tail is in-flight is the
-/// classic epoll_reactor race — TR-S2/TR-S3 in the audit). The
-/// `shutdown()` guard uses `exchange(true)` for idempotency
-/// (TR-S5). IPv6 wildcard listens disable `IPV6_V6ONLY` so a single
-/// listener accepts dual-stack traffic on Linux (TR-S4).
+/// it (closing the socket while the read tail is in-flight is the
+/// classic epoll_reactor race). The `shutdown()` guard uses
+/// `exchange(true)` for idempotency. IPv6 wildcard listens disable
+/// `IPV6_V6ONLY` so a single listener accepts dual-stack traffic
+/// on Linux.
 
 #pragma once
 

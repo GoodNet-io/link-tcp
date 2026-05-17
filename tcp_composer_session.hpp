@@ -46,7 +46,7 @@ public:
     void start_read();
 
     /// Queue an application send; serialised on the strand so the
-    /// single-writer invariant per `link.md` §4 holds for the L1
+    /// single-writer invariant per `link.en.md` §4 holds for the L1
     /// socket without contending with the read loop.
     void do_send(std::span<const std::uint8_t> bytes);
 

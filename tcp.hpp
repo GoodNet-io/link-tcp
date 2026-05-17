@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: MIT
 /// @file   plugins/links/tcp/tcp.hpp
-/// @brief  Asio TCP transport plugin per `docs/contracts/link.md`.
+/// @brief  Asio TCP transport plugin per `docs/contracts/link.en.md`.
 ///
 /// One io_context per plugin runs on a single worker thread; sessions
 /// are owned via `shared_ptr` and refer back to the transport with
 /// `weak_ptr` so async completions that fire after `shutdown()` are
 /// no-ops instead of UAF (per audit TR-C1 lesson). Per-session strand
-/// keeps the single-writer invariant from `link.md` §4: every
+/// keeps the single-writer invariant from `link.en.md` §4: every
 /// `async_write` runs on the strand, every close dispatches through
 /// it (closes the socket while the read tail is in-flight is the
 /// classic epoll_reactor race — TR-S2/TR-S3 in the audit). The
@@ -55,7 +55,7 @@ public:
     TcpLink& operator=(const TcpLink&) = delete;
 
     /// Bind the URI and start accepting. URI form per
-    /// `docs/contracts/uri.md` — `tcp://host:port` or
+    /// `docs/contracts/uri.en.md` — `tcp://host:port` or
     /// `tcp://[::1]:port`. Port 0 lets the OS pick; the actual
     /// bound port is available through `listen_port()`.
     [[nodiscard]] gn_result_t listen(std::string_view uri);
@@ -174,7 +174,7 @@ private:
     };
 
     /// Compute trust class from a remote endpoint per
-    /// `link.md` §3: loopback addresses → `Loopback`, public →
+    /// `link.en.md` §3: loopback addresses → `Loopback`, public →
     /// `Untrusted`. Trust upgrades to `Peer` happen later in the
     /// kernel after Noise completes.
     [[nodiscard]] gn_trust_class_t resolve_trust(
@@ -237,7 +237,7 @@ private:
     std::atomic<std::uint64_t> frames_in_{0};
     std::atomic<std::uint64_t> frames_out_{0};
 
-    /// Per-connection write-queue thresholds per `backpressure.md`
+    /// Per-connection write-queue thresholds per `backpressure.en.md`
     /// §1. Read from `api_->limits()` once `set_host_api` binds.
     /// Hard cap 0 disables hard reject; high cap 0 disables soft
     /// watermark publishing (the trio is independent at the slot

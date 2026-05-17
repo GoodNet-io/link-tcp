@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 /// @file   plugins/links/tcp/tests/test_tcp_conformance.cpp
 /// @brief  Instantiates the SDK link teardown conformance suite
-///         against `gn::link::tcp::TcpLink` so a `link.md` §9
+///         against `gn::link::tcp::TcpLink` so a `link.en.md` §9
 ///         shutdown regression in this plugin fails this plugin's
 ///         own `nix run .#test` instead of a kernel-side runner.
 

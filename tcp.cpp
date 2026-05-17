@@ -223,7 +223,7 @@ public:
 
     /// Snapshot the per-connection write-queue depth, in bytes.
     /// Producers consult this through the transport before queuing
-    /// fresh payload to enforce the `backpressure.md` §3 hard cap.
+    /// fresh payload to enforce the `backpressure.en.md` §3 hard cap.
     [[nodiscard]] std::uint64_t bytes_buffered() const noexcept {
         return bytes_buffered_.load(std::memory_order_relaxed);
     }
@@ -415,7 +415,7 @@ void TcpLink::set_host_api(const host_api_t* api) noexcept {
     /// hands over its limits table. A null `limits` slot leaves
     /// every threshold at zero — hard reject and watermark
     /// publishing both opt out, the transport behaves as before
-    /// `backpressure.md` shipped.
+    /// `backpressure.en.md` shipped.
     if (api_ != nullptr && api_->limits != nullptr) {
         if (const auto* L = api_->limits(api_->host_ctx); L != nullptr) {
             pending_queue_bytes_low_  = L->pending_queue_bytes_low;
@@ -625,7 +625,7 @@ gn_result_t TcpLink::connect(std::string_view uri_sv) {
 
     const auto parts = ::gn::parse_uri(*resolved);
     if (!parts || parts->is_path_style()) return GN_ERR_INVALID_ENVELOPE;
-    /// `connect`-side rejects port 0 per `uri.md` §5 — the parser
+    /// `connect`-side rejects port 0 per `uri.en.md` §5 — the parser
     /// accepts it for ephemeral allocation on the listen path, but
     /// a zero target port is never a real peer.
     if (parts->port == 0) return GN_ERR_INVALID_ENVELOPE;
@@ -1077,7 +1077,7 @@ void TcpLink::shutdown() {
     /// worker that emitted disconnect on its own thread before
     /// shutdown ran would leave zero caller-thread emits and break
     /// the `notify_connect → notify_disconnect on shutdown caller
-    /// thread` invariant from `link.md` §9 step 3.
+    /// thread` invariant from `link.en.md` §9 step 3.
     ///
     /// The kernel resolves the resulting double-emit through
     /// `GN_ERR_NOT_FOUND` (see `core/kernel/host_api_builder.cpp`

@@ -618,7 +618,7 @@ gn_result_t TcpLink::connect(std::string_view uri_sv) {
 
     /// Resolve hostname → IP literal up-front so the registry's URI
     /// index keys and the on-connect callback URI line up per
-    /// `dns.md` §1. IP-literal inputs short-circuit through the
+    /// `dns.en.md` §1. IP-literal inputs short-circuit through the
     /// helper without a lookup.
     auto resolved = ::gn::sdk::resolve_uri_host(ioc_, uri_sv);
     if (!resolved) return GN_ERR_INVALID_ENVELOPE;
@@ -654,7 +654,7 @@ gn_result_t TcpLink::connect(std::string_view uri_sv) {
     /// index key matches what the kernel observes through subsequent
     /// `find_by_uri` lookups, and the connect path's `?peer=<hex>`
     /// stash (keyed on `host:port`) lines up with the literal-host
-    /// form per `dns.md` §1.
+    /// form per `dns.en.md` §1.
     const std::string& canonical_uri = *resolved;
     session->socket().async_connect(ep,
         [weak = std::weak_ptr<TcpLink>(shared_from_this()),

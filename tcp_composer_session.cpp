@@ -55,7 +55,7 @@ void TcpLink::ComposerSession::start_read() {
 }
 
 void TcpLink::ComposerSession::do_send(std::span<const std::uint8_t> bytes) {
-    // Single-writer invariant per link.md §4: every async_write
+    // Single-writer invariant per link.en.md §4: every async_write
     // runs on the strand; queue any concurrent send so the prior
     // write completes first.
     std::vector<std::uint8_t> payload(bytes.begin(), bytes.end());

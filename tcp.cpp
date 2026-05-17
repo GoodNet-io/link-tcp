@@ -1082,8 +1082,9 @@ void TcpLink::shutdown() {
     /// thread` invariant from `link.en.md` §9 step 3.
     ///
     /// The kernel resolves the resulting double-emit through
-    /// `GN_ERR_NOT_FOUND` (see `core/kernel/host_api_builder.cpp`
-    /// `thunk_notify_disconnect`): the second call observes the
+    /// `GN_ERR_NOT_FOUND` (see
+    /// `core/kernel/host_api/notifications.cpp::notify_disconnect`):
+    /// the second call observes the
     /// already-erased registry record and returns without re-firing
     /// `DISCONNECTED`, so the redundant emit is benign.
     ///

@@ -98,7 +98,9 @@ public:
                                 /// kernel session's recv buffer is
                                 /// momentarily full. Bytes are
                                 /// **rejected** (not buffered) per
-                                /// `session.cpp:349`, so re-arming
+                                /// `core/security/session.cpp:377-379`
+                                /// (`recv_buffer_cap_bytes_` check),
+                                /// so re-arming
                                 /// the read immediately would lose
                                 /// the next chunk and break the AEAD
                                 /// nonce sequence. Park the rejected

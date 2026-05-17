@@ -5,8 +5,8 @@
 /// One io_context per plugin runs on a single worker thread; sessions
 /// are owned via `shared_ptr` and refer back to the transport with
 /// `weak_ptr` so async completions that fire after `shutdown()` are
-/// no-ops instead of UAF (per audit TR-C1 lesson). Per-session strand
-/// keeps the single-writer invariant from `link.en.md` §4: every
+/// no-ops instead of a use-after-free. Per-session strand keeps the
+/// single-writer invariant from `link.en.md` §4: every
 /// `async_write` runs on the strand, every close dispatches through
 /// it (closing the socket while the read tail is in-flight is the
 /// classic epoll_reactor race). The `shutdown()` guard uses

@@ -29,10 +29,10 @@ namespace {
 using namespace std::chrono_literals;
 using gn::link::tcp::TcpLink;
 
-/// Alias to the shared SDK helpers (DX Tier 2, 2026-05-12).
-/// The hand-rolled `StubHost` + `make_stub_api` + `wait_for` copies
-/// that used to live here at 78 LOC are now centralised in
-/// `sdk/cpp/test/stub_host.hpp` and `sdk/cpp/test/poll.hpp`.
+/// Alias to the shared SDK helpers in `sdk/cpp/test/stub_host.hpp`
+/// and `sdk/cpp/test/poll.hpp` — captures `notify_connect` /
+/// `notify_inbound_bytes` / `notify_disconnect` and the polling
+/// loop the TCP tests use to wait on async carriers.
 using StubHost = ::gn::sdk::test::LinkStub;
 
 inline host_api_t make_stub_api(StubHost& h) noexcept {

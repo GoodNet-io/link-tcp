@@ -1033,6 +1033,14 @@ TcpLink::find_session(gn_conn_id_t id) const {
 }
 
 void TcpLink::shutdown() {
+    /// FIRST — signal to any in-flight handler that we're tearing down.
+    /// Mirrors `UdpLink::shutdown()` (udp.cpp:835). Order matters: if we
+    /// close/reset the acceptor BEFORE flipping `shutdown_`, an asio
+    /// worker completing an in-flight accept enters `on_accept()`,
+    /// observes `shutdown_==false`, falls through to `start_accept()`,
+    /// and dereferences the just-nulled `acceptor_` optional.
+    if (shutdown_.exchange(true, std::memory_order_acq_rel)) return;
+
     if (acceptor_) {
         std::error_code ec;
         /// `close(ec)` is best-effort on shutdown — the FD is gone
@@ -1088,16 +1096,15 @@ void TcpLink::shutdown() {
     /// already-erased registry record and returns without re-firing
     /// `DISCONNECTED`, so the redundant emit is benign.
     ///
-    /// `shutdown_.exchange(true)` runs INSIDE the lock so a worker
-    /// callback racing with shutdown either (a) wins the lock first,
-    /// sees `shutdown_=false`, claims its id, and emits on the worker
-    /// thread, or (b) loses, sees `shutdown_=true`, and bails — the
-    /// drain below then carries the kernel-observable release on the
-    /// caller thread either way.
+    /// `shutdown_.exchange(true)` already fired at the top of
+    /// `shutdown()` (above the acceptor teardown). Any worker callback
+    /// that took `sessions_mu_` before us has already claimed its id
+    /// and pushed onto `published_ids_`; any worker arriving after us
+    /// sees `shutdown_=true` and bails. The drain below carries the
+    /// kernel-observable release on the caller thread either way.
     std::vector<gn_conn_id_t> ids_to_emit;
     {
         std::lock_guard lk(sessions_mu_);
-        if (shutdown_.exchange(true, std::memory_order_acq_rel)) return;
         ids_to_emit = std::move(published_ids_);
         published_ids_.clear();
         for (auto& [id, s] : sessions_) s->do_close();

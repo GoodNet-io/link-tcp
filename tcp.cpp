@@ -544,15 +544,17 @@ gn_result_t TcpLink::listen(std::string_view uri_sv) {
 }
 
 void TcpLink::start_accept() {
-    if (shutdown_.load(std::memory_order_acquire) || !acceptor_) return;
+    if (shutdown_.load(std::memory_order_acquire)) return;
 
     auto session = std::make_shared<Session>(
         asio::ip::tcp::socket(ioc_),
         weak_from_this());
 
-    /// Re-check `acceptor_.has_value()` immediately above the deref —
-    /// the lint pass doesn't track the early-return guard at the top
-    /// of the function across the intervening `make_shared` call.
+    /// `acceptor_mu_` pairs with the optional teardown in
+    /// `shutdown()`: the lock covers `has_value()` + the
+    /// `async_accept` deref so the inner `descriptor_state`
+    /// cannot be nulled between the two operations.
+    std::lock_guard lk(acceptor_mu_);
     if (!acceptor_.has_value()) return;
     auto& sock = session->socket();
     acceptor_->async_accept(sock,
@@ -1042,16 +1044,11 @@ void TcpLink::shutdown() {
     if (shutdown_.exchange(true, std::memory_order_acq_rel)) return;
 
     if (acceptor_) {
-        std::error_code ec;
-        /// `close(ec)` is best-effort on shutdown — the FD is gone
-        /// either way. Route the error through `gn_log_debug`;
-        /// `api_` may be null when the kernel tore down before
-        /// shutdown ran, in which case the macro short-circuits.
-        if (acceptor_->close(ec) && api_) {
-            gn_log_debug(api_,
-                      "tcp: acceptor close failed: %s",
-                      ec.message().c_str());
-        }
+        /// `acceptor_mu_` pairs with `start_accept()`: the lock
+        /// covers the full optional teardown so a worker on the
+        /// asio thread cannot read `has_value() == true` and
+        /// then deref an already-nulled inner `descriptor_state`.
+        std::lock_guard lk(acceptor_mu_);
         acceptor_.reset();
     }
 

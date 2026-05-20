@@ -217,6 +217,12 @@ private:
     std::vector<std::thread>                                  workers_;
 
     std::optional<asio::ip::tcp::acceptor> acceptor_;
+    /// Serialises `acceptor_.reset()` in `shutdown()` against the
+    /// `has_value()` check + `async_accept` deref pair in
+    /// `start_accept()`. The optional's dtor nulls the inner
+    /// `descriptor_state` before flipping `has_value()`, so the
+    /// pair has to run atomically against the reset.
+    mutable std::mutex                                                  acceptor_mu_;
     std::atomic<std::uint16_t>                    listen_port_{0};
     std::atomic<bool>                             shutdown_{false};
 

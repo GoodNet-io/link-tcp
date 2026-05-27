@@ -45,6 +45,15 @@ public:
     /// raw bytes to the composer's subscribed callback and re-arms.
     void start_read();
 
+    /// Initiate an async TCP connect to `endpoint`. The session is
+    /// registered before the connect lands; sends queued during the
+    /// pending window are drained on success. Failure drops the
+    /// session via `composer_drop_session`. Returns control to the
+    /// caller immediately so a hostile / unroutable remote cannot
+    /// stall the caller's strand for the kernel TCP retry budget
+    /// (`tcp_syn_retries` * RTO — ~127s on Linux defaults).
+    void start_connect(const asio::ip::tcp::endpoint& endpoint);
+
     /// Queue an application send; serialised on the strand so the
     /// single-writer invariant per `link.en.md` §4 holds for the L1
     /// socket without contending with the read loop.
@@ -61,6 +70,7 @@ private:
     asio::strand<asio::ip::tcp::socket::executor_type>          strand_;
     std::weak_ptr<TcpLink>                                      transport_;
     gn_conn_id_t                                                conn_id_;
+    bool                                                        connected_ = true;
     std::array<std::uint8_t, 64 * 1024>                         read_buf_{};
     std::deque<std::vector<std::uint8_t>>                       write_queue_;
 };

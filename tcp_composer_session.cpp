@@ -27,6 +27,32 @@ TcpLink::ComposerSession::ComposerSession(
       transport_(std::move(transport)),
       conn_id_(id) {}
 
+void TcpLink::ComposerSession::start_connect(
+    const asio::ip::tcp::endpoint& endpoint) {
+    // Mark not-yet-connected so `do_send` defers `kick_write` until
+    // the handshake lands. Posting onto the strand serialises the
+    // mutation with any concurrent `do_send` from the caller's
+    // thread that lost the race.
+    asio::post(strand_,
+        [self = shared_from_this(), endpoint]() {
+            self->connected_ = false;
+            self->socket_.async_connect(endpoint,
+                asio::bind_executor(self->strand_,
+                    [self](const std::error_code& ec) {
+                        auto t = self->transport_.lock();
+                        if (ec) {
+                            if (t) t->composer_drop_session(self->conn_id_);
+                            return;
+                        }
+                        self->connected_ = true;
+                        self->start_read();
+                        if (!self->write_queue_.empty()) {
+                            self->kick_write();
+                        }
+                    }));
+        });
+}
+
 void TcpLink::ComposerSession::start_read() {
     socket_.async_read_some(
         asio::buffer(read_buf_),
@@ -63,7 +89,7 @@ void TcpLink::ComposerSession::do_send(std::span<const std::uint8_t> bytes) {
         [self = shared_from_this(),
          payload = std::move(payload)]() mutable {
             self->write_queue_.push_back(std::move(payload));
-            if (self->write_queue_.size() == 1) {
+            if (self->connected_ && self->write_queue_.size() == 1) {
                 self->kick_write();
             }
         });

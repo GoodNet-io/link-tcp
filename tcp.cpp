@@ -876,7 +876,13 @@ gn_result_t TcpLink::composer_connect(std::string_view uri,
     asio::ip::tcp::endpoint endpoint(addr, parts->port);
 
     asio::ip::tcp::socket sock(ioc_);
-    sock.connect(endpoint, ec);
+    // Open the socket explicitly so async_connect has a bound
+    // descriptor; the kernel performs SYN retries asynchronously
+    // and the caller's thread never blocks. RFC 6544 ICE TCP checks
+    // depend on this — a synchronous `sock.connect` on an
+    // unroutable cross-LAN candidate would stall the ICE strand
+    // for the full `tcp_syn_retries` budget (~127s on Linux).
+    sock.open(endpoint.protocol(), ec);
     if (ec) return GN_ERR_NOT_FOUND;
 
     const gn_conn_id_t id =
@@ -888,7 +894,7 @@ gn_result_t TcpLink::composer_connect(std::string_view uri,
         std::lock_guard lk(composer_mu_);
         composer_sessions_[id] = cs;
     }
-    cs->start_read();
+    cs->start_connect(endpoint);
     *out_conn = id;
     return GN_OK;
 }

@@ -946,12 +946,17 @@ gn_result_t TcpLink::composer_unsubscribe_accept(
 gn_result_t TcpLink::composer_listen_port(
     std::uint16_t* out_port) const noexcept {
     if (!out_port) return GN_ERR_NULL_ARG;
-    *out_port = 0;
-    if (!composer_acceptor_) return GN_ERR_INVALID_STATE;
-    std::error_code ec;
-    const auto ep = composer_acceptor_->local_endpoint(ec);
-    if (ec) return GN_ERR_INVALID_STATE;
-    *out_port = ep.port();
+    // Prefer composer acceptor when present; fall back to listen_port_
+    // which is populated by BOTH the kernel listen path (TcpLink::listen)
+    // and the composer listen path (TcpLink::composer_listen).
+    if (composer_acceptor_) {
+        std::error_code ec;
+        const auto ep = composer_acceptor_->local_endpoint(ec);
+        if (!ec) { *out_port = ep.port(); return GN_OK; }
+    }
+    const auto port = listen_port_.load(std::memory_order_acquire);
+    if (port == 0) { *out_port = 0; return GN_ERR_INVALID_STATE; }
+    *out_port = port;
     return GN_OK;
 }
 

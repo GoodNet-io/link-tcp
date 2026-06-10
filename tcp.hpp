@@ -35,6 +35,7 @@
 
 #include <sdk/extensions/link.h>
 #include <sdk/host_api.h>
+#include <sdk/topology.h>
 #include <sdk/types.h>
 #include <sdk/trust.h>
 
@@ -132,6 +133,7 @@ public:
     /// `notify_*` calls flow through it. Pass `nullptr` to detach
     /// before destruction.
     void set_host_api(const host_api_t* api) noexcept;
+    void on_topology_sealed(const gn_topology_t* /*topo*/) noexcept {}
 
     /// Tear down. Idempotent; closes the acceptor, all sessions, and
     /// stops the io_context worker. Called once from the plugin
